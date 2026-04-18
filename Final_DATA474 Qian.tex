@@ -1,0 +1,69 @@
+\documentclass{article}
+\usepackage{tikz-cd}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{siunitx}
+
+% For BibTex
+\usepackage[round]{natbib}
+\bibliographystyle{apalike}
+\hypersetup{citecolor = blue}
+
+% To modify margins
+\usepackage[margin = 1in]{geometry}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{1em}
+
+% Title specific margins
+\usepackage{titling}
+\setlength{\droptitle}{-6em}
+
+% Add figures with borders
+\usepackage{graphicx}
+\usepackage{tcolorbox}
+\usepackage[labelfont = bf]{caption}
+
+\title{Congestive Heart Failure Diagnostics \vspace{-2ex}}
+\author{Weslee Nguyen and Sedona O'Hearn | DATA474 | Professor Qian}
+\date{}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{document}
+
+\maketitle
+\vspace{-20mm}
+\section*{Introduction}
+\vspace{-6mm}
+Congestive Heart Failure (CHF) affects over 60 million worldwide and continues to increase in prevalence, which imposes significant financial burden in the billions in symptom management and therapeutic intervention \citep{CHFManagement2023}. Thus, CHF was our focus for the midterm project ``Congestive Heart Failure Classification'' \citep{Midterm2026}. We used the National Health and Nutrition Examination Survey (NHANES), an American nationwide survey that provides open-source information on participant demographics, the environment, and mental and physical health, for example whether or not participants have had CHF \citep{CHF-NHANESA2024}. This is key as CHF is known to have biological (adult males, hypertension, coronary artery disease), psychological (anxiety, depression, diet), and social (family history, socioeconomic status, healthcare access) factors, to name a few \citep{CHFPathophysiology2021, CHF-BPSM2025}. We aim to best classify whether or not participants have had CHF, thus benefits from supervised machine learning (SML) to build successful prediction models.
+
+Our last report utilized forward stepwise subset selection and LASSO-based logistic regression with unacceptable recall and precision. All models tested often deferred to be conservative in labeling participants as not having had CHF due to there being only a few hundred who has had CHF among thousands (unpublished data). This is problematic as a good model should (\textbf{I}) know who to divert resources to prevent the occurrence or reoccurrence of CHF, (\textbf{II}) minimize healthcare costs needed to treat CHF, and thus (\textbf{III}) minimize CHF severity for patients who has successfully been labeled to prevent CHF. 
+
+Thus, we turn to an \textit{a priori} technique well known in diagnostics, where a sensitive ``rule-out'' test is applied to rule out true negatives, and then for positive results, a specific ``rule-in'' test is applied to confirm a true positive \citep{SenSpec2017}. This corresponds running a model and rule-out participants who have a low predicted probability of having had CHF. Then a new model is trained on the true and false positives of the last model to rule-in participants who have a high predicted probability of having had CHF. This is beneficial as (\textbf{A}) sensitivity-specificity test pipelines have been well established as diagnostically useful, (\textbf{B}) the ``signal'' (have had CHF) increases relative to ``noise'' (not having had CHF) by the second test, and (\textbf{C}) is practically useful where ``rule-out'' tests are often accessible and affordable to be used en-masse, thus limiting resource allocation to predicting CHF to those who tested positive on the sensitivity test rather than the whole population \citep{SenSpec2017}. The selected features per model then can be used to make physical tests.
+
+In class, we covered many popular SML techniques: Linear and Logistic Regression, Naive Bayes, Decision Trees, Random Forest, Support Vector Machines (SVM), k-Nearest Neighbor, and Neural Networks, all of which with well-studied pros and cons due to their popularity. We test two separate parallel pipelines: the first is using a Decision Tree, then SVM. Decision Trees are interpretable in precisely stating which features are key. Then SVM, normally prohibitive with large datasets, has a smaller dataset while still being able to handle high-dimensional data \citep{SML2025}. The second is we still use Binary Logistic Regression that indicates significant features, then apply a Neural Network with hyperparameters determined by randomly searching across a small search space \citep{NN2025}, where the neural network will be manually examined to determine feature importance. Thus, these methods have potential to properly predict whether or not participants have had CHF with an emphasize on interpretability and practical applications.
+
+\vspace{-6mm}
+\section*{Methods}
+\vspace{-6mm}
+
+The preprocessing is the same as the midterm project \citep{Midterm2026}. The involving datasets have been obtained for this project: demographics (DEMO$\_$L), diet (DR2TOT$\_$L), blood pressure (BPXO$\_$L), body measures (BMX$\_$L), mental health (DPQ$\_$L), medical conditions (MCQ$\_$L), physical activity (PAQ$\_$L), diabetes (DIQ$\_$L), cigarette use (SMQ$\_$L), standard biochemistry profile (BIOPRO$\_$L), complete blood count (CBC$\_$L), albumin and creatinine (ALB$\_$CR$\_$L), and environmental chemical exposure (PBCD$\_$L) (being lead, cadmium, total mercury, selenium, and manganese). Each dataset was downloaded from the CDC website for NHANES and converted from xpt to csv. The following preprocessing steps were taken:
+
+\begin{enumerate}
+	\item Merge all datasets via SEQN, which is the unique identification number per participant.
+	\item Retain only participants 18 years or older.
+	\item Only retain participants who explicitly answered Y/N to having CHF (nearly 4,000 didn't respond).
+	\item Drop empty predictors (has $> 30\%$ lack responses).
+	\item To impute (MICE), remove highly multicollinear columns. Groups where each variable had $>95\%$ correlation was reduced down to one variable, which was chosen randomly.
+	\item Perform multiple imputation with chained equations (MICE) with predictive mean matching (PMM).
+\end{enumerate}
+
+Due to step (\textbf{4}) and (\textbf{5}), the dataset was reduced (p = 204, n = 6055). Most predictors removed had child-specific measurements (e.g. head and arm circumference, child dietary recalls), follow-up variables (e.g. had and still have thyroid problems), and converting measurements (e.g. eosinophilic percent to count). 
+
+\vspace{-1em}
+\bibliography{Final_NHANES_citations}
+\end{document}
