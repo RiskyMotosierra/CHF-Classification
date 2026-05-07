@@ -1,26 +1,44 @@
 ---
+instal---
 title: "Midterm Project: DATA474 Qian"
-author: "Weslee Nguyen and Sedona O'Hearn"
+author: "Weslee Nguyen, Sedona O'Hearn, and Jacob Stevens"
 format: pdf
 editor: visual
 ---
 
 # Libraries
 
+library(rpart.plot)
+
+library(rpart)
+
 ```{r}
 #| echo: false
 #| warning: false
 
+# For Step #1: Preprocessing, I don't use since the dataset is already made
+library(mice)       # For imputation
+library(igraph)     # To later visualize highly correlated vars
+library(corrplot)   # Correlation heatmap
+
+# For Step #2 onwards!
 library(tidyverse)
-library(dplyr)
-library(ggplot2)
-library(mice)     # For imputation
-library(igraph)   # To later visualize highly correlated vars
-library(corrplot) # Correlation heatmap
-library(purrr)    # Like mapply, lapply, sapply
-library(glmnet)   # Fits LASSO for logistic regression
-library(caret)    # Confusion matrix
-library(MASS)     # Stepwise Subset Selection
+library(caret)      # Confusion matrix
+library(pROC)       # Evaluate models using ROC curves and AUC
+library(vip)        # Variable Importance Plots (VIP)
+library(e1071)      # For SVM
+library(kernlab)    # For SVM as well
+
+library(rpart.plot)
+library(rpart)      # Decision Trees (first one I got when looking it up for R)
+  # https://www.geeksforgeeks.org/r-language/decision-tree-in-r-programming/
+  # Followed this tutorial - Weslee
+
+library(tidymodels) # Preprocessing pipeline for modeling
+  # Already has libraries purrr, dplyr, ggplot2, recipes, tidyr
+  # Will have to update a lot of libraries to use this
+
+library(vip)        # Quantify importance per feature
 ```
 
 # CHF Classification
@@ -180,316 +198,345 @@ Documentation:
 
 -   [Physical Activity](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/PAQ_L.htm)
 
-## Step #2: Exploratory Data Analysis
+## Step #2: Decision Tree to SVM Model
+
+We only have 258/6055 (\~4.26%) CHF cases, thus we need some way to navigate the noise. This is roughly better than the estimated CHF incidence across American adults (6.7 million / 267 million = 2.51%) in terms of Signal-to-Noise Ratio (SNR). As a result, we are invested in experimenting methods to reduce SNR via a rule-out model to eliminate sure-cases without noise ([*Decision Tree*]{.underline}) with **low-threshold, max-sensitivity** capturing as much true positives, then a rule-in model to select the signal ([*Support Vector Model*]{.underline}) with **high-threshold, max-specificity** to select as much true positives.
+
+### Step #2.1: Get Decision Tree
+
+Intuitively, we care more about a false negative than a false positive. That's because we're okay shoving the false positive into the second round, but [we need the false negative]{.underline} pass into the sound round. So I want to give extra penalty to misclassifying a false negative where I take a confusion matrix and applying penalty, before I pass another decision tree, where heuristically, a false negative is 10x worse than a false positive:
+
+|                     | **Predicted No CHF**    | **Predicted Yes CHF**  |
+|---------------------|-------------------------|------------------------|
+| **True No** **CHF** | 0                       | 1 \[*False Positive*\] |
+| **True Yes CHF**    | 10 \[*False Negative*\] | 0                      |
+
+Apparently, this is already well-known (whatever Claude), termed a **LOSS MATRIX**, part of rpart.
 
 ```{r}
 
 NHANES_cleaned <- read.csv("NHANES_cleaned.csv")
 
-################################################################################
-################################ FIGURE I ######################################
-################################################################################
+# Drop 1st column (it's just row number) and factorize CHF
+NHANES_cleaned <- NHANES_cleaned[, -1] %>%
+  mutate(CHF = factor(CHF, levels = c("0", "1"), labels = c("No", "Yes")))
 
-# I) Make mini-correlation heatmap related to CHF
-
-cor_with_chf <- cor(NHANES_cleaned)["CHF", ]
-cor_with_chf <- sort(abs(cor_with_chf), decreasing = TRUE)
-top10_predictors <- names(cor_with_chf)[2:11]
-top10_predictors
-
-# MCQ160E: Heart Attack
-# MCQ160P: COPD/Emphysema/Chronic Bronchitis
-# DIQ010: Diabetes
-# RIDAGEYR: Age
-# BMXWAIST: Waist Circumference
-# LBXSCR: Serum Creatinine
-# LBXRDW: Red Blood Cell Distribution Width
-# LBXSBU: Blood Urea Nitrogen
-# LBXSCH: Serum Cholesterol
-# LBXSUA: Serum Uric Acid
-
-mini_NHANES <- NHANES_cleaned %>%
-  select(MCQ160E, MCQ160P, DIQ010, RIDAGEYR, BMXWAIST,
-         LBXSCR, LBXRDW, LBXSBU, LBXSCH, LBXSUA, CHF) %>%
-  mutate(
-    MCQ160E = ifelse(MCQ160E == 1, 1, 0),
-    MCQ160P = ifelse(MCQ160P == 1, 1, 0),
-    DIQ010 = ifelse(DIQ010 == 1, 1, 0)
-  ) %>%
-  rename(
-    Heart_Attack = MCQ160E,
-    Chronic_Breathing_Issues = MCQ160P,
-    Diabetes = DIQ010,
-    Age = RIDAGEYR,
-    Waist_Circumference = BMXWAIST,
-    Serum_Creatinine = LBXSCR,
-    RBC_Distribution_Width = LBXRDW,
-    Blood_Urea_Nitrogen = LBXSBU,
-    Serum_Cholesterol = LBXSCH,
-    Serum_Uric_Acid = LBXSUA
-  )
-
-pretty_labels <- c(
-  "CHF",
-  "Heart Attack",
-  "Chronic Breathing Issues",
-  "Diabetes",
-  "Age (years)",
-  "Waist Circumference (cm)",
-  "Serum Creatinine (mg/dL)",
-  "RBC Distribution Width (%)",
-  "BUN (mg/dL)",
-  "Serum Cholesterol (mg/dL)",
-  "Serum Uric Acid (mg/dL)"
-)
-
-cor_matrix <- cor(mini_NHANES)
-rownames(cor_matrix) <- pretty_labels
-colnames(cor_matrix) <- pretty_labels
-corrplot(cor_matrix, method = "color", type = "upper", addCoef.col = "black", 
-         tl.srt = 45, tl.cex = 0.8, number.cex = 0.5)
-
-################################################################################
-################################################################################
-################################################################################
-
-# II) Histograms of Variables Most Correlated with CHF
-
-pretty_labels <- c(
-  Heart_Attack = "Heart Attack",
-  Chronic_Breathing_Issues = "Chronic Breathing Issues",
-  Diabetes = "Diabetes",
-  Age = "Age (yrs)",
-  Waist_Circumference = "Waist Circumference (cm)",
-  Serum_Creatinine = "Serum Creatinine (mg/dL)",
-  RBC_Distribution_Width = "RBC Distribution Width (%)",
-  Blood_Urea_Nitrogen = "Blood Urea Nitrogen (mg/dL)",
-  Serum_Cholesterol = "Serum Cholesterol (mg/dL)",
-  Serum_Uric_Acid = "Serum Uric Acid (mg/dL)"
-)
-
-NHANES_pivot <- mini_NHANES %>% pivot_longer(
-  cols = everything(), names_to = "variable", values_to = "value"
-)
-
-ggplot(NHANES_pivot, aes(x = value)) +
-  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
-  facet_wrap(~variable, scales = "free", nrow = 3,
-             labeller = labeller(variable = pretty_labels)) +
-  labs(
-    y = "Count",
-    title = "Histogram of Variables Most Correlated with CHF"
-  ) +
-  theme_minimal() +
-  theme(axis.title.x = element_blank(),
-        strip.text = element_text(size = 6),
-        plot.title = element_text(hjust = 0.5))
-
-################################################################################
-################################################################################
-################################################################################
-
-# III) Look at the 3 binary variables given CHF = 1 v. 0
-binary_vars <- mini_NHANES %>% select(Heart_Attack, Chronic_Breathing_Issues, 
-                                      Diabetes, CHF)
-
-long_binary <- binary_vars %>%
-  pivot_longer(
-    cols = c(Heart_Attack, Chronic_Breathing_Issues, Diabetes),
-    names_to = "variable",
-    values_to = "value"
-  )
-
-plot_data <- long_binary %>%
-  group_by(variable, value) %>%
-  summarise(
-    CHF_rate = mean(CHF, na.rm = TRUE),
-    n = n(),
-    .groups = "drop"
-  )
-
-ggplot(plot_data, aes(x = factor(value), y = CHF_rate, fill = factor(value))) +
-  geom_col(linewidth = 1, color = "black") +
-  facet_wrap(~variable, scales = "free_x", 
-             labeller = labeller(variable = pretty_labels)) +
-  scale_fill_manual(
-    values = c("0" = "skyblue", "1" = "salmon"),
-    labels = c("0" = "Never Had/Have (0)", "1" = "Had/Have (1)")
-  ) +
-  labs(
-    y = "Proportion",
-    fill = "CHF",
-    title = "Proportion of Medical Issues Having Had v. Not Had CHF"
-  ) +
-  theme_minimal() +
-  theme(axis.title.x = element_blank(),
-        plot.title = element_text(hjust = 0.5),
-        legend.position = "bottom")
-
-################################################################################
-################################################################################
-################################################################################
-
-# IV) Look at continuous variables for CHF = 1 v. 0
-
-continuous_vars <- mini_NHANES %>% select(CHF, Age, Waist_Circumference, 
-         Serum_Creatinine, RBC_Distribution_Width, Blood_Urea_Nitrogen, 
-         Serum_Cholesterol, Serum_Uric_Acid)
-
-long_cont <- continuous_vars %>%
-  pivot_longer(
-    cols = -CHF,
-    names_to = "variable",
-    values_to = "value"
-  )
-
-ggplot(long_cont, aes(x = factor(CHF), y = value, fill = factor(CHF))) +
-  geom_boxplot(linewidth = 0.3, color = "black") +
-  facet_wrap(~variable, scales = "free_y", nrow = 3,
-             labeller = labeller(variable = pretty_labels)) +
-  scale_fill_manual(
-    values = c("0" = "skyblue", "1" = "salmon"),
-    labels = c("0" = "Never Had/Have (0)", "1" = "Had/Have (1)")
-  ) +
-  labs(
-    y = "Value",
-    fill = "CHF",
-    title = "Correlated Continuous Measures Had v. Not Had CHF"
-  ) +
-  theme_minimal() +
-  theme(
-    axis.title.x = element_blank(),
-    legend.position = "bottom",
-    plot.title = element_text(hjust = 0.5),
-  )
-```
-
-That gets four subfigures for the main EDA figure.
-
-```{r}
-
-################################################################################
-################################ TABLE I #######################################
-################################################################################
-
-# Mean / Proportion for CHF = 0, 1 per variable
-
-vars <- colnames(mini_NHANES)
-vars <- vars[vars != "CHF"]
-
-summarize_var <- function(data, var) {
-  
-  df <- data %>% select(CHF, all_of(vars))
-  
-  CHF0 <- df %>% filter(CHF == 0) %>% pull(var)
-  CHF1 <- df %>% filter(CHF == 1) %>% pull(var)
-  
-  mean0 <- mean(CHF0)
-  mean1 <- mean(CHF1)
-  
-  se0 <- sd(CHF0) / sqrt(length(CHF0))
-  se1 <- sd(CHF1) / sqrt(length(CHF1))
-  
-  test <- t.test(CHF0, CHF1)
-
-  tibble(
-    Variable = var,
-    Mean0 = mean0,
-    SE0 = se0,
-    Mean1 = mean1,
-    SE1 = se1,
-    Ratio = mean1 / mean0,
-    t_stat = test$statistic,
-    p_value = test$p.value,
-    Mean_diff = mean1 - mean0,
-    CI_lower = test$conf.int[1],
-    CI_upper = test$conf.int[2]
-  )
-}
-
-summary_table <- map_dfr(vars, ~ summarize_var(mini_NHANES, .x))
-summary_table
-```
-
-That gets the necessary information to populate Table I.
-
-## Step #3: Screen-and-Stepwise Model
-
-Due to nearly having 200 variables, one can significantly reduce the number of predictors before testing. One can employ PCA or some other dimensionality reduction, however that means the new predictors (being components) and subsequent units becomes uninterpretable. Alternatively, one can use the odds ratio. While it doesn't test significance, does keep predictors where the population of those with CHF has a different enough magnitude from those without. That way, the number of predictors is significantly reduced to test run a subset selection. Those best selection is absurd with $2^{27}$ viable models, one that merges front and backward stepwise selection serves as a balance to choose a model towards a relatively small AIC, a con being that insignificant predictors may still be included.
-
-```{r}
-
-X_names <- setdiff(names(NHANES_cleaned), "CHF")
-Y <- NHANES_cleaned$CHF
-
-# Get rid of weak odds ratio
-screen_OR <- sapply(X_names, function(var) {
-  formula <- as.formula(paste("CHF ~", var))
-  model <- glm(formula, data = NHANES_cleaned, family = binomial)
-  exp(coef(model)[2])  # OR
-})
-
-# Get if odds ratio > 1.5
-selected_vars <- names(screen_OR[abs(screen_OR - 1) > 0.5])
-selected_vars <- unique(selected_vars)
-length(selected_vars) # is 27 long
-
-# OR duplicates e.g. OSQ230 -> OSQ230.OSQ230, so trim
-# \\. = period, .*$ = everything after, "" = replace with nothing
-selected_vars <- sub("\\..*$", "", selected_vars)
-selected_vars <- selected_vars[!is.na(selected_vars)]
-
-# Initialize full model
-full_model <- as.formula(
-  paste("CHF ~", paste(selected_vars, collapse = " + "))
-)
-
-final_data <- NHANES_cleaned[, c(selected_vars, "CHF")]
-initial_model <- glm(full_model, data = NHANES_cleaned, family = binomial)
-
-# AIC Stepwise Selection (Forwards + Backwards)
-# Takes about a minute--just let it run for a bit
-final_model <- stepAIC(initial_model, direction = "both", trace = FALSE)
-summary(final_model)
-length(coef(final_model)) - 1 
-# 19 predictors remain, of which 12 significant
-# DON'T REMOVE LAST 7, recall model keeps vars based on AIC, not p-values
-
-pred <- predict(final_model, type = "response")
-pred_class <- ifelse(pred > 0.5, 1, 0)
-pred_class <- factor(pred_class, levels = c(0,1))
-y_factor <- factor(final_data$CHF, levels = c(0,1))
-confusionMatrix(pred_class, y_factor, positive = "1")
-```
-
-## Step #4: LASSO Logistic Regression
-
-Alternatively, one can use all (nearly) 200 predictors, however that is not only overwhelming, but risks lack of practical interpretability (with too many factors to consider for CHF). Thus, logistic regression would benefit using LASSO to aggressively enforce parsimony.
-
-```{r}
-
-# Initialize matrices
-X <- as.matrix(NHANES_cleaned[, colnames(NHANES_cleaned) != "CHF"])
-Y <- NHANES_cleaned$CHF
-
-# Meant to show how coefficients die as lambda increases
-LASSO_model <- glmnet(X, Y, family = "binomial", alpha = 1)
-plot(LASSO_model, xvar = "lambda", label = TRUE)
-
-# Do 10-fold CV fitting bunch of LASSO Logistics
+# Do 80/20 split while preserving CHF prevalence
 set.seed(123)
-kfold_CV <- cv.glmnet(X, Y, family = "binomial", alpha = 1, nfolds = 10)
-plot(kfold_CV) # 1st dashed line is lambda min, 2nd is lambda min + 1 SE
+split  <- initial_split(NHANES_cleaned, prop = 0.80, strata = CHF)
+train  <- training(split)
+test   <- testing(split)
 
-# Extract model with best lambda and coefficients
-kfold_CV$lambda.min # Not parsimonious ... ~90 predictors, sensitivity = 21.32%
-kfold_CV$lambda.1se # Absurdly parsimonious at 14 predictors, sensitivity = 3.88%
-coef(kfold_CV, s = "lambda.min")
+###############################
+# See loss matrix commentary above--we make the penalty matrix
+loss_matrix <- matrix(c(0, 1, 10, 0), nrow = 2, byrow = TRUE)
 
-# Predict from best model
-pred <- predict(kfold_CV, newx = X, s = "lambda.min", type = "response")
-pred_class <- ifelse(pred > 0.5, 1, 0)
-pred_class <- factor(pred_class, levels = c(0,1))
-y_factor <- factor(Y, levels = c(0,1))
-confusionMatrix(pred_class, y_factor, positive = "1")
+###############################
+# Initialize tree, fix hyperparameters to get idea
+# Why those hyperparameters? I'm ok getting as many false positives (nonimportant    # predictors involved in the decision tree) to see obvious true positives.
+  # Hence, I'm ok if the tree is (1) deep, (2) easy to split, and (3) complex
+tree <- decision_tree(
+  tree_depth  = 10,   # shallow (how many splits allowed)
+  min_n       = 20,   # minimum obs to split node (like speciation)
+  cost_complexity = 0.001) %>% # see notes; allows complexitiy, Gini Cross-Entropy
+  set_engine("rpart", parms = list(loss = loss_matrix)) %>%
+  set_mode("classification")   # Predictor is categorical
+
+###############################
+# Get the working df with the tree
+working_df <- workflow() %>%
+  add_formula(CHF ~ .) %>%
+  add_model(tree)
+
+fitted_df <- fit(working_df, data = train)
+
+###############################
+# Make it crazy big and read the png
+  # So each node as in order of 1, 2, 3, 4 top-to-bottom:
+  # 1: Classify Y/N, 2: P(No), 3: P(Yes), 4: % of training sample
+  # Can't read tree, so put into png to be zoominable from there
+png("tree_plot.png", width = 3000, height = 2000, res = 150)
+rpart.plot(
+  fitted_df$fit$fit$fit,
+  type = 4,
+  extra = 104,
+  box.palette = "RdYlGn",
+  main = "Stage 1 Decision Tree (Rule-Out)"
+)
+dev.off()
+
+###############################
+# Read the output directly
+  # 1st entry: Condition, 2nd: Total obs...
+  # 3rd: Loss if I predicted majority class here (hence all multiples of 10)
+  # * denote terminal node (leaf = vertex degree 1)
+  # So based off png and model, 87% of data has...
+  # MCQ160C, E, and P >= 1.5, where 4222 No, 55 Yes (recall 0.8*258 = 206 Yes)
+fitted_df$fit$fit$fit
+
+# See what features I should care about
+  # Importance = sum(abs(reductions in Gini Entropy per split))
+  # https://www.geeksforgeeks.org/machine-learning/
+      # gini-impurity-and-entropy-in-decision-tree-ml/
+  # MCQ160C: Coronary Heart Disease
+  # MCQ160E: Heart Attack
+  # MCQ160P: COPD, Emphysema, Chronic Bronchitis
+  # RIDAGEYR: Age of participants
+  # LBXRDW:  Red blood cell distribution width
+  # MCQ160D: Angina Pectoris (weaker version of Heart Attack)
+png("tree_VIP.png", width = 800, height = 400, res = 120)
+vip(fitted_df, num_features = 20, geom = "col") +
+  labs(title = "Top 20 Features by Importance for Decision Tree") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+dev.off()
+```
+
+### Step #2.2: Be More Rigorous with Hyperparameters
+
+Can't get it to work ;(
+
+```{r}
+
+# tree <- decision_tree(
+#   tree_depth      = tune(),
+#   min_n           = tune(),
+#   cost_complexity = tune()) %>%
+#   set_engine("rpart", parms = list(loss = loss_matrix)) %>%
+#   set_mode("classification")
+# 
+# working_tune <- workflow() %>%
+#   add_formula(CHF ~ .) %>%
+#   add_model(tree)
+# 
+# # 5-fold CV (not 10 to ease computation), do stratified to maintain CHF prevalence
+# # 64 * 5 = 320 models X__X RIP my laptop
+# folds <- vfold_cv(train, v = 5, strata = CHF)
+# 
+# # Data-driven as (10, 20, 0.001) got me good stuff, so look around
+# grid <- grid_regular(
+#   tree_depth(range = c(5, 15)),
+#   min_n(range = c(10, 50)),
+#   cost_complexity(range = c(-4, -2)), # is log10, so 0.0001 to 0.01
+#   levels = 4                          # 4 per parameters -> 4^3 = 64 combos
+# )
+# 
+# # Want threshold-independent measure, w/ high sens + spec, so use ROC AUC
+# tune_results <- tune_grid(
+#   working_tune,
+#   resamples = folds,
+#   grid = grid,
+#   metrics = metric_set(roc_auc),
+#   control = control_grid(event_level = "second")
+# )
+# 
+# autoplot(tune_results)
+# # We get high ROC AUC for (I) more nodes, (II) less depth, (III) higher cost
+# 
+# best_tree_params <- tune_results %>% select_best(metric = "roc_auc")
+# best_tree_params # Reflects autoplot inference
+#
+# # Get the tree from the chosen hyperparameters
+#   # finalize_workflow: Fits tree given chosen hyperparameters
+# final_workflow <- working_tune %>% finalize_workflow(best_tree_params)
+# fitted_df <- fit(final_workflow, data = train)
+```
+
+### Step #2.3: Obtain and Apply the Tree-Based Model
+
+```{r}
+
+# 3 column df: .pred_No, .pred_Yes, and ground truth CHF per participant
+predict_df <- predict(fitted_df, train, type = "prob") %>%
+  bind_cols(select(train, CHF))
+
+threshold_table <- predict_df %>% roc_curve(truth = CHF, .pred_Yes, 
+                                            event_level = "second")
+
+rule_out_threshold <- threshold_table %>%
+  filter(sensitivity >= 0.90) %>%   # Get at least 90% of true CHF (sensitivity)
+  slice_max(specificity, n = 1) %>% # Max true negatives ruled out (specificity) 
+  pull(.threshold)                  # Get that threshold
+
+rule_out_threshold
+
+###############################
+# Plot what exactly is threshold_table
+png("rule_out_tree.png", width = 800, height = 400, res = 120)
+threshold_table %>%
+  pivot_longer(cols = c(sensitivity, specificity),
+               names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = .threshold, y = value, colour = metric)) +
+  geom_line(linewidth = 2) +
+  geom_vline(xintercept = rule_out_threshold,
+             linetype = "dashed", colour = "red", linewidth = 2) +
+  labs(title = "Sensitivity & Specificity by Rule-Out Threshold",
+       x = "Threshold", y = NULL, colour = NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+dev.off()
+
+###############################
+# Apply threshold to rule-out
+train_another <- predict_df %>%
+  bind_cols(train %>% select(-CHF)) %>%
+  mutate(Stage1 = ifelse(.pred_Yes >= rule_out_threshold, "Yes", "No")) %>%
+  filter(Stage1 == "Yes") %>%
+  select(-starts_with(".pred"), -Stage1)
+
+# Very good! Most true CHF retained (absolute) with increased SNR (relative)
+train_another %>% count(CHF, name = "Count")
+mean(train_another$CHF == "Yes")
+
+# Tried to get the rules for ruling-out but that's for another time...
+```
+
+### Step #2.4: Get Support-Vector Machine
+
+```{r}
+
+# Preprocess columns
+recipe_svm <- recipe(CHF ~ ., data = train_another) %>%
+  step_zv(all_predictors()) %>%            # Remove 0 variance columns
+  step_normalize(all_numeric_predictors()) # Scale data for SVM
+
+# Radial Basis Function (RBF) Kernel
+svm_specifity <- svm_rbf(
+  cost      = tune(),        # Regularisation
+  rbf_sigma = tune()) %>%    # Kernel bandwidth
+  set_engine("kernlab") %>%  # Kernel-based SVM
+  set_mode("classification")
+
+working_svm_df <- workflow() %>%
+  add_recipe(recipe_svm) %>%
+  add_model(svm_specifity)
+
+###############################
+# 5-fold CV, stratified on CHF
+folds <- vfold_cv(train_another, v = 5, strata = CHF)
+
+# Random search over a small space
+svm_grid <- grid_random(
+  cost(range = c(-1, 2)),          # 10^(-1) to 10^2
+  rbf_sigma(range = c(-3, -1)),    # 10^(-3) to 10^(-1)
+  size = 15
+)
+
+# Tune with sensitivity
+svm_results <- tune_grid(
+  working_svm_df,
+  resamples = folds,
+  grid      = svm_grid,
+  metrics   = metric_set(roc_auc, sensitivity, precision),
+  control   = control_grid(save_pred = TRUE)
+)
+
+###############################
+autoplot(svm_results)
+
+# Best by ROC AUC
+best_svm <- select_best(svm_results, metric = "roc_auc")
+best_svm
+
+final_svm     <- finalize_workflow(working_svm_df, best_svm)
+fitted_svm_df <- fit(final_svm, data = train_another)
+```
+
+### Step #2.5: Obtain and Apply SVM-Based Model
+
+```{r}
+
+# Basically same code from #2.3 adapted to SVM
+predict_svm_df <- predict(fitted_svm_df, train_another, type = "prob") %>%
+  bind_cols(select(train_another, CHF))
+
+threshold_svm <- predict_svm_df %>%
+  roc_curve(truth = CHF, .pred_Yes, event_level = "second")
+
+rule_in_threshold <- threshold_svm %>%
+  # Lax sensitivty >= 0.7, but highest specificity for precision
+  filter(sensitivity >= 0.7) %>%
+  slice_max(specificity, n = 1) %>%
+  pull(.threshold)
+
+rule_in_threshold
+
+###############################
+# Basically same plot as 1st model
+png("rule_in_SVM.png", width = 800, height = 400, res = 120)
+threshold_svm %>%
+  select(.threshold, sensitivity, specificity) %>%
+  pivot_longer(cols = c(sensitivity, specificity),
+               names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = .threshold, y = value, colour = metric)) +
+  geom_line(linewidth = 2) +
+  geom_vline(xintercept = rule_in_threshold,
+             linetype = "dashed", colour = "red", linewidth = 2) +
+  labs(title = "Sensitivity & Specificity by Rule-In Threshold",
+       x = "Threshold", y = NULL, colour = NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+dev.off()
+
+###############################
+# Apply threshold to rule-in
+final_df <- predict_svm_df %>%
+  bind_cols(train_another %>% select(-CHF)) %>%
+  mutate(Stage2 = ifelse(.pred_Yes >= rule_in_threshold, "Yes", "No")) %>%
+  filter(Stage2 == "Yes") %>%
+  select(-starts_with(".pred"), -Stage2)
+
+# Alright, most CHF retained with only a few false positives, some false negatives
+final_df %>% count(CHF, name = "Count")
+mean(final_df$CHF == "Yes")
+```
+
+### Step #2.6: Evaluate on Test Set
+
+```{r}
+
+###############################
+# 1) Decision tree to test set
+###############################
+test_tree_df <- predict(fitted_df, test, type = "prob") %>%
+  bind_cols(select(test, CHF))
+
+test_flagged_idx <- which(test_tree_df$.pred_Yes >= rule_out_threshold)
+test_flagged     <- test[test_flagged_idx, ]
+
+test %>% count(CHF, name = "Count")
+test_flagged %>% count(CHF, name = "Count")
+
+###############################
+# 2) SVM to test set
+###############################
+test_svm_df <- predict(fitted_svm_df, test_flagged, type = "prob") %>%
+  bind_cols(select(test_flagged, CHF))
+
+# Final prediction vector for the whole test set
+final_pred  <- rep("No", nrow(test)) # Initialize
+svm_call    <- if_else(test_svm_df$.pred_Yes >= rule_in_threshold, "Yes", "No")
+final_pred[test_flagged_idx]  <- svm_call
+
+final_pred  <- factor(final_pred, levels = c("No", "Yes"))
+truth       <- test$CHF
+
+###############################
+# 3) Moment of truth...
+###############################
+results <- tibble(truth = truth, estimate = final_pred)
+sens  <- sensitivity(results,  truth, estimate, event_level = "second")
+spec  <- specificity(results,  truth, estimate, event_level = "second")
+ppv   <- ppv(results,          truth, estimate, event_level = "second")
+npv   <- npv(results,          truth, estimate, event_level = "second")
+bacc  <- bal_accuracy(results, truth, estimate, event_level = "second")
+
+bind_rows(sens, spec, ppv, npv, bacc) %>%
+  select(.metric, .estimate) %>% print()
+
+# Confusion matrix is pretty bad...
+conf_mat(results, truth, estimate) %>% autoplot(type = "heatmap") +
+  labs(title = "Test Confusion Matrix for Decision Tree to SMV") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
 ```
