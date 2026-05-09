@@ -1,0 +1,919 @@
+---
+instal---
+title: "Final Project: DATA474 Qian"
+author: "Weslee Nguyen, Sedona O'Hearn, and Jacob Stevens"
+format: pdf
+editor: visual
+---
+
+# Libraries
+
+library(rpart.plot)
+
+library(rpart)
+
+```{r}
+#| echo: false
+#| warning: false
+
+# For Step #1: Preprocessing, I don't use since the dataset is already made
+library(mice)       # For imputation
+library(igraph)     # To later visualize highly correlated vars
+library(corrplot)   # Correlation heatmap
+
+# For Step #2 onwards!
+library(tidyverse)
+library(caret)      # Confusion matrix
+library(pROC)       # Evaluate models using ROC curves and AUC
+library(vip)        # Variable Importance Plots (VIP)
+library(e1071)      # For SVM
+library(kernlab)    # For SVM as well
+
+library(rpart.plot)
+library(rpart)      # Decision Trees (first one I got when looking it up for R)
+  # https://www.geeksforgeeks.org/r-language/decision-tree-in-r-programming/
+  # Followed this tutorial - Weslee
+
+library(tidymodels) # Preprocessing pipeline for modeling
+  # Already has libraries purrr, dplyr, ggplot2, recipes, tidyr
+  # Will have to update a lot of libraries to use this
+
+library(vip)        # Quantify importance per feature
+library(DALEXtra)   # Try to elucidate SVM via PDPs
+library(nnet)       # For neural networks
+```
+
+# CHF Classification
+
+## Step #1: Preprocessing
+
+```{r}
+#| eval: FALSE
+
+albumin_creatinine <- read.csv("Datasets/albumin-creatinine.csv")
+biochem_panel <- read.csv("Datasets/biochem_panel.csv")
+blood_pressure <- read.csv("Datasets/blood_pressure.csv")
+body_measures <- read.csv("Datasets/body_measures.csv")
+CBC <- read.csv("Datasets/CBC.csv")
+cigarettes <- read.csv("Datasets/cigarettes.csv")
+demographics <- read.csv("Datasets/demographics.csv")
+diabetes <- read.csv("Datasets/diabetes.csv")
+diet_second_day <- read.csv("Datasets/diet_second_day.csv")
+environmental_pollutants <- read.csv("Datasets/environmental_pollutants.csv")
+medical_conditions <- read.csv("Datasets/medical_conditions.csv")
+mental_health <- read.csv("Datasets/mental_health.csv")
+physical_activity <- read.csv("Datasets/physical_activity.csv")
+
+datasets <- list(
+  albumin_creatinine,
+  biochem_panel,
+  blood_pressure,
+  body_measures,
+  CBC,
+  cigarettes,
+  demographics,
+  diabetes,
+  diet_second_day,
+  environmental_pollutants,
+  medical_conditions,
+  mental_health,
+  physical_activity
+)
+
+# There's column X in all of them, get rid of it
+datasets_clean <- map(datasets, ~ select(.x, -any_of("X")))
+
+# Merge all datasets by unique participant identifier SEQN
+NHANES <- reduce(datasets_clean, inner_join, by = "SEQN")
+
+# Only retain adults and people who answered Y/N to CHF
+NHANES <- NHANES %>% filter(RIDAGEYR >= 18, MCQ160B %in% c(1, 2)) %>%
+  mutate(CHF = if_else(MCQ160B == 1, 1, 0)) %>%
+  select(-MCQ160B)
+
+# Factorize for classification; 1 = Has CHF, 0 = No CHF
+NHANES$CHF <- factor(NHANES$CHF, levels = c(0, 1))
+
+# Drop empty predictors (>30% NAs)
+NA_vars <- NHANES %>%
+  summarise(across(everything(), ~ mean(is.na(.), na.rm = FALSE))) %>%
+  pivot_longer(
+    cols = everything(), 
+    names_to = "variable", 
+    values_to = "NA_percent") %>%
+  arrange(desc(NA_percent))
+
+# Many variables tossed as they're kid-specific e.g. head circumference
+# BMI Variables to Toss: BMXRECUM, BMIRECUM, BMXHEAD, BMDBMIC, BMIHT, BMIARM, 
+      # BMIARMC, BMIWAIST, BMIWT, BMIHIP, BMILEG
+# Smoking Variables: SMQ040, SMQ621, SMD630, SMD641, SMD650, SMD100MN
+# Demographics: RIDAGEMN, RIDEXAGM, RIDEXPRG, DMDYRUSR, DMDHRGND, DMDHRAGZ
+      # DMDHREDZ, DMDHRMAZ, DMDHSEDZ
+# Medical Conditions: MCQ149 (Liver),  MCQ500 (Cancer), MCQ230A-D (Cancer)
+      # MCQ510A-F (Cancer, all), MCQ035 + MCQ040 (Asthma), MCQ050 (Thyroid)
+      # MCQ170L/M (Liver + Thyroid), MCQ195 (Arthritis)
+# Diabetes: DIQ040 (Age of Dx), DIQ050 (insulin), DIQ060 + DIQ060U (Meds), DIQ070
+# Mental Health: DPQ100 (Depression score)
+# Physical Activity: PAD820 (Leisurely Activity)
+# Diet Recall: DR2SKY (Sugar intake), DR2DBIH (Dietary intake)
+# Lab work: LBXSLDSI (Serum Sodium)
+
+vars_to_keep <- NA_vars %>%
+  filter(NA_percent <= 0.3) %>%
+  pull(variable)
+
+NHANES <- NHANES %>% select(any_of(vars_to_keep))
+
+##### MULTICOLLINEARITY: Remove vars basically the same, else MICE crashes
+numeric_vars <- NHANES %>% select(where(is.numeric))
+cor_matrix <- cor(numeric_vars, use = "pairwise.complete.obs") # Avoid NAs
+
+cor_pairs <- cor_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "cor") %>%
+  filter(var1 != var2) %>%          # remove diagonal as cor = 1
+  filter(abs(cor) > 0.95) %>%       # threshold cor = 0.95
+  arrange(desc(abs(cor)))
+
+cor_pairs
+
+# Turn cor_pairs into graph to see connected components
+# Remove from each component till there's only one member
+edges <- cor_pairs %>% select(var1, var2)
+g <- graph_from_data_frame(edges, directed = FALSE)
+clusters <- components(g)
+clusters$membership
+
+# There's 30 clusters = remove at least 30 variables
+# Simply chose 1 per cluster
+# Any lab variables = starts with LBX; diet = DR2, body measure = LBD, urine = URX
+NHANES <- NHANES %>% select(-c(LBXSTB, LBDSGBSI, LBDSTPSI, LBDSALSI, URXUMS, 
+                 URXCRS, WTPH2YR.y, WTPH2YR.x, LBDBMNSI, LBDBCDSI, LBDSCRSI, 
+                 LBDTHGSI, LBDSUASI, LBDSCHSI, LBDSTRSI, LBDBPBSI, LBDBSESI, 
+                 LBDSBUSI, LBDSPHSI, LBDSIRSI, DR2TM181, DR2TP182, DR2DRSTZ, 
+                 LBDSGLSI, DR2TP226, DR2TS160, DR2TFDFE, LBXHCT, DR2TP225, 
+                 DR2TS060, DR2TS140, LBDSCASI, RIDRETH3, BPXOPLS1, WTMEC2YR, 
+                 DR2TTFAT, DR2TS180, PAD790U, PAD810U, BPAOARM, DRABF, 
+                 LBDBPBLC, LBDBSELC, LBDBMNLC, URDUCRLC))
+
+##### IMPUTATION: Use MICE to imputate remaining missing data
+# Handles continuous and categorical data
+# Treat NA variable as dependent, regress on all other variables
+# Predictive Mean Matching (PMM): Find other cases w/ similar predicted values, 
+      # then randomly choose one of their actual observed values for imputation--
+      # thus assumes data is missing at random (no pattern)
+# m = 5 imputed datasets made for stabilized guessing
+
+imputation <- mice(NHANES, m = 1, method = "pmm", seed = 123)
+NHANES <- complete(imputation)
+
+# Export to make sure it's never ruined!
+NHANES_cleaned <- write.csv(NHANES, "NHANES_cleaned.csv")
+```
+
+Documentation:
+
+-   [Albumin-Creatinine](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/ALB_CR_L.htm)
+
+-   [Biochemistry Panel](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/BIOPRO_L.htm)
+
+-   [Blood Pressure](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/BPXO_L.htm)
+
+-   [Body Measures](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/BMX_L.htm)
+
+-   [Complete Blood Count](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/CBC_L.htm)
+
+-   [Cigarettes](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/SMQ_L.htm)
+
+-   [Demographics](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/DEMO_L.htm#SEQN)
+
+-   [Diabetes](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/DIQ_L.htm)
+
+-   [Diet](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/DR2TOT_L.htm#DR2TP182)
+
+-   [Environmental Pollutants](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/PBCD_L.htm)
+
+-   [Medical Conditions](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/MCQ_L.htm#MCQ160b)
+
+-   [Mental Health](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/DPQ_L.htm#DPQ070)
+
+-   [Physical Activity](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/PAQ_L.htm)
+
+## Step #2: Decision Tree to SVM Model
+
+We only have 258/6055 (\~4.26%) CHF cases, thus we need some way to navigate the noise. This is roughly better than the estimated CHF incidence across American adults (6.7 million / 267 million = 2.51%) in terms of Signal-to-Noise Ratio (SNR). As a result, we are invested in experimenting methods to reduce SNR via a rule-out model to eliminate sure-cases without noise ([*Decision Tree*]{.underline}) with **low-threshold, max-sensitivity** capturing as much true positives, then a rule-in model to select the signal ([*Support Vector Model*]{.underline}) with **high-threshold, max-specificity** to select as much true positives.
+
+### Step #2.1: Get Decision Tree
+
+Intuitively, we care more about a false negative than a false positive. That's because we're okay shoving the false positive into the second round, but [we need the false negative]{.underline} pass into the sound round. So I want to give extra penalty to misclassifying a false negative where I take a confusion matrix and applying penalty, before I pass another decision tree, where heuristically, a false negative is 10x worse than a false positive:
+
+|                     | **Predicted No CHF**    | **Predicted Yes CHF**  |
+|---------------------|-------------------------|------------------------|
+| **True No** **CHF** | 0                       | 1 \[*False Positive*\] |
+| **True Yes CHF**    | 10 \[*False Negative*\] | 0                      |
+
+Apparently, this is already well-known (whatever Claude), termed a **LOSS MATRIX**, part of rpart.
+
+```{r}
+
+NHANES_cleaned <- read.csv("NHANES_cleaned.csv")
+
+# Drop 1st column (it's just row number) and factorize CHF
+NHANES_cleaned <- NHANES_cleaned[, -1] %>%
+  mutate(CHF = factor(CHF, levels = c("0", "1"), labels = c("No", "Yes")))
+
+# Do 80/20 split while preserving CHF prevalence
+set.seed(123)
+split  <- initial_split(NHANES_cleaned, prop = 0.80, strata = CHF)
+train  <- training(split)
+test   <- testing(split)
+
+###############################
+# See loss matrix commentary above--we make the penalty matrix
+loss_matrix <- matrix(c(0, 1, 10, 0), nrow = 2, byrow = TRUE)
+
+###############################
+# Initialize tree, fix hyperparameters to get idea
+# Why those hyperparameters? I'm ok getting as many false positives (nonimportant    # predictors involved in the decision tree) to see obvious true positives.
+  # Hence, I'm ok if the tree is (1) deep, (2) easy to split, and (3) complex
+tree <- decision_tree(
+  tree_depth  = 10,   # shallow (how many splits allowed)
+  min_n       = 20,   # minimum obs to split node (like speciation)
+  cost_complexity = 0.001) %>% # see notes; allows complexitiy, Gini Cross-Entropy
+  set_engine("rpart", parms = list(loss = loss_matrix)) %>%
+  set_mode("classification")   # Predictor is categorical
+
+###############################
+# Get the working df with the tree
+working_df <- workflow() %>%
+  add_formula(CHF ~ .) %>%
+  add_model(tree)
+
+fitted_df <- fit(working_df, data = train)
+
+###############################
+# Make it crazy big and read the png
+  # So each node as in order of 1, 2, 3, 4 top-to-bottom:
+  # 1: Classify Y/N, 2: P(No), 3: P(Yes), 4: % of training sample
+  # Can't read tree, so put into png to be zoominable from there
+png("exploratory_tree_plot.png", width = 3000, height = 2000, res = 150)
+rpart.plot(
+  fitted_df$fit$fit$fit,
+  type = 4,
+  extra = 104,
+  box.palette = "RdYlGn",
+  main = "Exploratory Rule-Out Decision Tree"
+)
+dev.off()
+
+###############################
+# Read the output directly
+  # 1st entry: Condition, 2nd: Total obs...
+  # 3rd: Loss if I predicted majority class here (hence all multiples of 10)
+  # * denote terminal node (leaf = vertex degree 1)
+  # So based off png and model, 87% of data has...
+  # MCQ160C, E, and P >= 1.5, where 4222 No, 55 Yes (recall 0.8*258 = 206 Yes)
+fitted_df$fit$fit$fit
+
+# See what features I should care about
+  # Importance = sum(abs(reductions in Gini Entropy per split))
+  # https://www.geeksforgeeks.org/machine-learning/
+      # gini-impurity-and-entropy-in-decision-tree-ml/
+  # MCQ160C: Coronary Heart Disease
+  # MCQ160E: Heart Attack
+  # MCQ160P: COPD, Emphysema, Chronic Bronchitis
+  # LBXRDW:  Red blood cell distribution width
+  # RIDAGEYR: Age of participants
+  # URXUMA: Urine albumin value
+  # BMXHIP: Hip circumference; BMXBMI: Body Mass Index (BMI)
+png("exploratory_tree_VIP.png", width = 800, height = 400, res = 120)
+vip(fitted_df, num_features = 20, geom = "col") +
+  labs(title = "Top 20 Features by Importance for Decision Tree") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+dev.off()
+
+###############################
+# Now, albuminuria is a key marker for CHF, but they return to normal with t(x)
+  # https://academic.oup.com/eurheartj/article/44/5/368/6711732
+  # That's important as we're looking at people who had CHF already!
+  # Namely, the only way albuminuria is predictive is if they're about
+  # to or are currently experiencing CHF. Which is the goal of this project,
+  # but would be treated as a weak rule-in signal, and maybe a rule-out signal
+  # if interpreted in tandem with other predictors
+  # For example, RDW predicts short- and long-term outcomes of acute CHF,
+    # So if Albumin Levels + RDW are both healthy, more signs to rule-out
+    # https://pmc.ncbi.nlm.nih.gov/articles/PMC4079416/
+
+# Additionally, higher BMI is linked to longevity and higher probability of CHF,
+  # termed the "Obesity Paradox": https://pmc.ncbi.nlm.nih.gov/articles/PMC10579501/
+  # The hazard ratio was high for underweight and overweight,
+  # Suggesting that healthy participants (BMI) can be ruled-out.
+  # With Hip circumference a proxy, we want BMI instead for overall adiposity
+
+# The other predictors are either meaningless or biologically related
+# Thus, to reduce overfitting, we simplify to the following predictors: 
+  # MCQ160C, E, P, LBXRDW, RIDAGEYR, URXUMA, BMXBMI
+
+selected_vars <- c("MCQ160C", "MCQ160E", "MCQ160P", "LBXRDW", 
+                   "RIDAGEYR", "URXUMA", "BMXBMI", "CHF")
+
+train_selected <- train %>% select(all_of(selected_vars))
+
+# Now I want a smaller tree for sparsity and preventing overfitting
+tree <- decision_tree(
+  tree_depth  = 7,  # As we have exactly 7 predictors
+  min_n       = 20,
+  cost_complexity = 0.001) %>%
+  set_engine("rpart", parms = list(loss = loss_matrix)) %>%
+  set_mode("classification")
+
+
+working_selected <- workflow() %>%
+  add_formula(CHF ~ .) %>%
+  add_model(tree)
+
+fitted_df <- fit(working_selected, data = train_selected)
+
+###############################
+# Make and save plot
+png("data_driven_tree_plot.png", width = 3000, height = 2000, res = 150)
+rpart.plot(
+  fitted_df$fit$fit$fit,
+  type = 4,
+  extra = 104,
+  box.palette = "RdYlGn",
+  main = "Data-Driven Rule-Out Decision Tree"
+)
+dev.off()
+
+fitted_df$fit$fit$fit
+
+#Make and save plot
+png("data_driven_tree_VIP.png", width = 800, height = 400, res = 120)
+vip(fitted_df, num_features = 20, geom = "col") +
+  labs(title = "Important Features for Data-Driven Decision Tree") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+dev.off()
+```
+
+### Step #2.2: Obtain and Apply the Tree-Based Model
+
+I initially wanted to range over hyperparameters with a tuning grid, but I couldn't get it to work for the decision tree. With a lack of time, I'll just steam forward.
+
+```{r}
+
+# 3 column df: .pred_No, .pred_Yes, and ground truth CHF per participant
+predict_df <- predict(fitted_df, train_selected, type = "prob") %>%
+  bind_cols(select(train_selected, CHF))
+
+threshold_table <- predict_df %>% roc_curve(truth = CHF, .pred_Yes, 
+                                            event_level = "second")
+
+rule_out_threshold <- threshold_table %>%
+  filter(sensitivity >= 0.90) %>%   # Get at least 90% of true CHF (sensitivity)
+  slice_max(specificity, n = 1) %>% # Max true negatives ruled out (specificity) 
+  pull(.threshold)                  # Get that threshold
+
+rule_out_threshold
+
+###############################
+# Plot what exactly is threshold_table
+png("rule_out_tree.png", width = 800, height = 400, res = 120)
+threshold_table %>%
+  pivot_longer(cols = c(sensitivity, specificity),
+               names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = .threshold, y = value, colour = metric)) +
+  geom_line(linewidth = 2) +
+  geom_vline(xintercept = rule_out_threshold,
+             linetype = "dashed", colour = "red", linewidth = 2) +
+  labs(title = "Sensitivity & Specificity by Rule-Out Threshold",
+       x = "Threshold", y = NULL, colour = NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+dev.off()
+
+###############################
+# Apply threshold to rule-out
+train_another <- predict_df %>%
+  bind_cols(train %>% select(-CHF)) %>%
+  mutate(Stage1 = ifelse(.pred_Yes >= rule_out_threshold, "Yes", "No")) %>%
+  filter(Stage1 == "Yes") %>%
+  select(-starts_with(".pred"), -Stage1)
+
+# Very good! Most true CHF retained (absolute) with increased SNR (relative)
+train_another %>% count(CHF, name = "Count")
+train_selected %>% count(CHF, name = "Count")
+mean(train_another$CHF == "Yes")
+mean(train_selected$CHF == "Yes")
+
+###############################
+# Get rules for the ruled-out leaves
+leaf_summary <- tibble(
+  leaf     = fitted_df$fit$fit$fit$where,
+  pred_yes = predict(fitted_df, train_selected, type = "prob")$.pred_Yes) %>%
+  group_by(leaf) %>%
+  summarise(p_yes = first(pred_yes),  # same within leaf, so take first
+            n     = n()) %>%
+  mutate(flagged = p_yes >= rule_out_threshold) %>%
+  arrange(p_yes)
+
+ruled_out_leaves <- leaf_summary %>% filter(!flagged) %>% pull(leaf)
+ruled_out_leaves
+
+rules <- rpart.rules(fitted_df$fit$fit$fit, roundint = FALSE, cover = TRUE)
+apply(rules, 1, function(row) paste(row[!is.na(row)], collapse = " ")) %>%
+  as_tibble()
+
+###############################
+# Get Decision Tree training error
+predict(fitted_df, train_selected, type = "class") %>%
+  bind_cols(select(train_selected, CHF)) %>%
+  rename(predicted = .pred_class) %>%
+  conf_mat(truth = CHF, estimate = predicted)
+```
+
+### Step #2.3: Get Support-Vector Machine
+
+```{r}
+
+# Preprocess columns
+recipe_svm <- recipe(CHF ~ ., data = train_another) %>%
+  step_zv(all_predictors()) %>%            # Remove 0 variance columns
+  step_normalize(all_numeric_predictors()) # Scale data for SVM
+
+# Radial Basis Function (RBF) Kernel
+svm_specifity <- svm_rbf(
+  cost      = tune(),        # Regularisation
+  rbf_sigma = tune()) %>%    # Kernel bandwidth
+  set_engine("kernlab") %>%  # Kernel-based SVM
+  set_mode("classification")
+
+working_svm_df <- workflow() %>%
+  add_recipe(recipe_svm) %>%
+  add_model(svm_specifity)
+
+###############################
+# 5-fold CV, stratified on CHF
+folds <- vfold_cv(train_another, v = 5, strata = CHF)
+
+# Random search over a small space
+svm_grid <- grid_random(
+  cost(range = c(-1, 2)),          # 10^(-1) to 10^2
+  rbf_sigma(range = c(-3, -1)),    # 10^(-3) to 10^(-1)
+  size = 15
+)
+
+# Tune with sensitivity
+svm_results <- tune_grid(
+  working_svm_df,
+  resamples = folds,
+  grid      = svm_grid,
+  metrics   = metric_set(roc_auc, sensitivity, precision),
+  control   = control_grid(save_pred = TRUE)
+)
+
+###############################
+autoplot(svm_results)
+
+# Best by ROC AUC
+best_svm <- select_best(svm_results, metric = "roc_auc")
+best_svm
+
+final_svm     <- finalize_workflow(working_svm_df, best_svm)
+fitted_svm_df <- fit(final_svm, data = train_another)
+```
+
+### Step #2.4: Obtain and Apply SVM-Based Model
+
+```{r}
+
+# Basically same code from #2.3 adapted to SVM
+predict_svm_df <- predict(fitted_svm_df, train_another, type = "prob") %>%
+  bind_cols(select(train_another, CHF))
+
+threshold_svm <- predict_svm_df %>%
+  roc_curve(truth = CHF, .pred_Yes, event_level = "second")
+
+# Lax sensitivty >= 0.7, but highest specificity for precision
+# Is returning a lot of threshold for some reason? Force only one via with_ties
+rule_in_threshold <- threshold_svm %>%
+  filter(sensitivity >= 0.7) %>%
+  slice_max(specificity, n = 1, with_ties = FALSE) %>%
+  pull(.threshold)
+
+rule_in_threshold
+
+###############################
+# Basically same plot as 1st model
+png("rule_in_SVM.png", width = 800, height = 400, res = 120)
+threshold_svm %>%
+  select(.threshold, sensitivity, specificity) %>%
+  pivot_longer(cols = c(sensitivity, specificity),
+               names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = .threshold, y = value, colour = metric)) +
+  geom_line(linewidth = 2) +
+  geom_vline(xintercept = rule_in_threshold,
+             linetype = "dashed", colour = "red", linewidth = 2) +
+  labs(title = "Sensitivity & Specificity by Rule-In Threshold",
+       x = "Threshold", y = NULL, colour = NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+dev.off()
+
+###############################
+# Apply threshold to rule-in
+final_df <- predict_svm_df %>%
+  bind_cols(train_another %>% select(-CHF)) %>%
+  mutate(Stage2 = ifelse(.pred_Yes >= rule_in_threshold, "Yes", "No")) %>%
+  filter(Stage2 == "Yes") %>%
+  select(-starts_with(".pred"), -Stage2)
+
+# Alright, most CHF retained with only a few false positives, some false negatives
+final_df %>% count(CHF, name = "Count")
+mean(final_df$CHF == "Yes")
+
+###############################
+# Get SVM training error
+predict(fitted_svm_df, train_another, type = "prob") %>%
+  bind_cols(select(train_another, CHF)) %>%
+  mutate(predicted = factor(
+    ifelse(.pred_Yes >= rule_in_threshold, "Yes", "No"),
+    levels = c("No", "Yes"))) %>%
+  conf_mat(truth = CHF, estimate = predicted)
+
+###############################
+# Figure out features
+explainer <- explain_tidymodels(fitted_svm_df,
+  data  = train_another %>% select(-CHF),
+  y = as.numeric(train_another$CHF == "Yes"), label = "SVM"
+)
+
+pdp <- model_profile(explainer, variables = c("RIDAGEYR", "LBXRDW", "URXUMA",
+                                  "MCQ160E", "MCQ160P", "MCQ160C", "BMXBMI"))
+
+# Takes every participant, fixes given variable to given x-axis value, then
+  # runs SVM. It averages the predicted probability of having CHF for the y-axis
+  # Honestly I have no clue why this is all blue
+png("SVM_features.png", width = 800, height = 400, res = 120)
+plot(pdp) + labs(title = "Parital Dependence Plots of SVM", subtitle = NULL) +
+  ylab("Average Prediction of CHF") +
+  theme(plot.title = element_text(hjust = 0.5, color = "black"),
+        strip.text = element_text(hjust = 0.5, color = "black", 
+                                  size = 10, face = "bold"),
+        axis.title.y = element_text(color = "black"))
+dev.off()
+
+###############################
+# Overall training error
+
+# Decision Tree
+train_stage1 <- predict(fitted_df, train_selected, type = "prob") %>%
+  bind_cols(train_selected) %>%
+  mutate(stage1 = ifelse(.pred_Yes >= rule_out_threshold, "Yes", "No"))
+
+# Get flagged participants
+flagged_idx <- which(train_stage1$stage1 == "Yes")
+train_flagged_full <- train[flagged_idx, ]
+
+# SVM
+train_stage2 <- predict(fitted_svm_df, train_flagged_full, type = "prob") %>%
+  bind_cols(select(train_flagged_full, CHF)) %>%
+  mutate(predicted = factor(
+    ifelse(.pred_Yes >= rule_in_threshold, "Yes", "No"),
+    levels = c("No", "Yes")))
+
+# Double-whammy Tree -> SVM
+final_train_preds <- train_stage1 %>%
+  mutate(predicted = factor(
+    ifelse(stage1 == "No", "No",
+           ifelse(train_stage2$predicted[match(row_number(), 
+                  which(train_stage1$stage1 == "Yes"))] == "Yes", 
+                  "Yes", "No")),
+    levels = c("No", "Yes")))
+
+# Confusion matrix
+conf_mat(final_train_preds, truth = CHF, estimate = predicted)
+```
+
+### Step #2.5: Evaluate on Test Set
+
+```{r}
+
+###############################
+# 1) Decision tree to test set
+###############################
+
+test_selected <- test %>% select(all_of(selected_vars))
+test_tree_df <- predict(fitted_df, test_selected, type = "prob") %>%
+    bind_cols(select(test_selected, CHF))
+
+test_flagged_idx <- which(test_tree_df$.pred_Yes >= rule_out_threshold)
+test_flagged     <- test[test_flagged_idx, ]
+
+test %>% count(CHF, name = "Count")
+test_flagged %>% count(CHF, name = "Count")
+
+# Get confusion matrix
+test_tree_preds <- tibble(
+  truth    = test_selected$CHF,
+  estimate = factor(
+    ifelse(test_tree_df$.pred_Yes >= rule_out_threshold, "Yes", "No"),
+    levels = c("No", "Yes"))
+)
+
+conf_mat(test_tree_preds, truth, estimate) %>% autoplot(type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "salmon") +
+  labs(title = "Test Confusion Matrix for Decision Tree") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+###############################
+# 2) SVM to test set
+###############################
+test_svm_df <- predict(fitted_svm_df, test_flagged, type = "prob") %>%
+  bind_cols(select(test_flagged, CHF))
+
+# Final prediction vector for the whole test set
+final_pred  <- rep("No", nrow(test)) # Initialize
+svm_call    <- if_else(test_svm_df$.pred_Yes >= rule_in_threshold, "Yes", "No")
+final_pred[test_flagged_idx]  <- svm_call
+
+final_pred  <- factor(final_pred, levels = c("No", "Yes"))
+truth       <- test$CHF
+
+###############################
+# 3) Moment of truth...
+###############################
+results <- tibble(truth = truth, estimate = final_pred)
+sens  <- sensitivity(results,  truth, estimate, event_level = "second")
+spec  <- specificity(results,  truth, estimate, event_level = "second")
+ppv   <- ppv(results,          truth, estimate, event_level = "second")
+npv   <- npv(results,          truth, estimate, event_level = "second")
+f1    <- f_meas(results,       truth, estimate, event_level = "second")
+bacc  <- bal_accuracy(results, truth, estimate, event_level = "second")
+
+bind_rows(sens, spec, ppv, npv, f1, bacc) %>%
+  select(.metric, .estimate) %>% print()
+
+# Confusion matrix is pretty bad...
+conf_mat(results, truth, estimate) %>% autoplot(type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "salmon") +
+  labs(title = "Test Confusion Matrix for Decision Tree to SVM") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+## Step #3: LASSO Logistic Regression to Neural Network Model
+
+I used createDataPartition from Caret instead of initial_split() from tidymodels.
+
+```{r}
+train_index <- createDataPartition(
+  NHANES_cleaned$CHF,
+  p = 0.80,
+  list = FALSE
+)
+train_data <- NHANES_cleaned[train_index, ]
+test_data  <- NHANES_cleaned[-train_index, ]
+```
+
+The imbalanced ratio of CHF cases to non CHF cases makes it highly difficult to classify accurately. Because of this, many models tend to favor predicting the majority non-CHF class, resulting in high overall accuracy but poor sensitivity and recall for true CHF cases. To address this issue, we first used logistic regression as a feature selection and screening method to identify the most clinically relevant predictors associated with CHF. These predictors were then used as inputs into a neural network model.
+
+### Step #3.1: Create Logistic Regression Model
+
+```{r}
+run_lasso_selector <- function(train_data) {
+  X_train <- as.matrix(train_data[, colnames(train_data) != "CHF"])
+  Y_train <- train_data$CHF
+  set.seed(123)
+  kfold_CV <- cv.glmnet(
+    X_train,
+    Y_train,
+    family = "binomial",
+    alpha = 1,
+    nfolds = 10
+  )
+  lasso_coef <- coef(kfold_CV, s = "lambda.min")
+  selected_vars <- rownames(lasso_coef)[
+    which(lasso_coef[, 1] != 0)
+  ]
+  selected_vars <- selected_vars[selected_vars != "(Intercept)"]
+  list(
+    model = kfold_CV,
+    selected_vars = selected_vars,
+    coefficients = lasso_coef,
+    lambda_min = kfold_CV$lambda.min,
+    lambda_1se = kfold_CV$lambda.1se
+  )
+}
+```
+
+### Step #3.2: Select Predictors
+
+Variables for the neural network were selected using the lasso logistic regression model.
+
+```{r}
+lasso_selector <- run_lasso_selector(train_data)
+
+selected_vars <- lasso_selector$selected_vars
+
+lasso_coef <- as.matrix(lasso_selector$coefficients)
+
+coef_df <- data.frame(
+  Variable = rownames(lasso_coef),
+  Coefficient = as.numeric(lasso_coef[, 1])
+) %>%
+  filter(Variable != "(Intercept)",
+         Coefficient != 0) %>%
+  arrange(desc(abs(Coefficient)))
+
+coef_plot <- ggplot(
+  coef_df,
+  aes(
+    x = reorder(Variable, abs(Coefficient)),
+    y = abs(Coefficient)
+  )
+) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "LASSO-Selected Predictors",
+    x = "Predictor",
+    y = "|LASSO Coefficient|"
+  ) +
+  theme_minimal()
+
+coef_plot
+
+ggsave(
+  "lasso_feature_importance.png",
+  plot = coef_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+### Step #3.3: Tune Neural Network
+
+While logistic regression provides strong interpretability, it assumes a linear relationship between predictors and the log-odds of CHF. Neural networks allow more flexible nonlinear decision boundaries and may improve predictive performance by capturing more complex relationships among predictors.
+
+The neural network hyperparameters were tuned over a small search space to improve classification performance on the imbalanced CHF dataset. Hidden layer size, weight decay regularization, and classification threshold were systematically varied to evaluate their impact on model accuracy, precision, recall, and AUC. Because identifying true CHF cases was prioritized over maximizing overall accuracy, the final model was selected using the F1 score, which balances precision and recall. Lower classification thresholds generally improved sensitivity and recall by increasing the number of predicted CHF cases, though at the cost of additional false positives.
+
+```{r}
+run_neural_network_model <- function(train_data, test_data, selected_vars,
+                                     size = 5, decay = 0.01, threshold = 0.5) {
+  
+  X_train <- train_data[, selected_vars]
+  X_test  <- test_data[, selected_vars]
+  
+  preproc <- preProcess(X_train, method = c("center", "scale"))
+  
+  X_train_scaled <- predict(preproc, X_train)
+  X_test_scaled  <- predict(preproc, X_test)
+  
+  train_scaled <- data.frame(X_train_scaled, CHF = train_data$CHF)
+  test_scaled  <- data.frame(X_test_scaled, CHF = test_data$CHF)
+  
+  set.seed(123)
+  
+  nn_model <- nnet(
+    CHF ~ .,
+    data = train_scaled,
+    size = size,
+    decay = decay,
+    maxit = 500,
+    trace = FALSE
+  )
+  
+  pred <- predict(nn_model, newdata = test_scaled, type = "raw")
+  pred <- as.numeric(pred)
+  
+  pred_class <- ifelse(pred > threshold, "Yes", "No")
+  pred_class <- factor(pred_class, levels = c("No", "Yes"))
+
+  y_factor <- test_scaled$CHF
+
+  cm <- confusionMatrix(pred_class, y_factor, positive = "Yes")
+  
+  auc_value <- as.numeric(auc(roc(test_scaled$CHF, pred)))
+  
+  list(
+    model = nn_model,
+    selected_vars = selected_vars,
+    size = size,
+    decay = decay,
+    threshold = threshold,
+    confusion = cm,
+    pred_prob = pred,
+    pred_class = pred_class,
+    AUC = auc_value,
+    preprocessing = preproc
+  )
+}
+
+###############################
+tune_neural_network <- function(train_data, test_data, selected_vars) {
+  sizes <- c(2, 3, 5, 8, 10)
+  decays <- c(0.0001, 0.001, 0.01, 0.05, 0.1)
+  thresholds <- c(0.25, 0.3, 0.35, 0.4, 0.45, 0.5)
+
+  results <- data.frame()
+  for (s in sizes) {
+    for (d in decays) {
+      for (t in thresholds) {
+        nn <- run_neural_network_model(
+          train_data,
+          test_data,
+          selected_vars,
+          size = s,
+          decay = d,
+          threshold = t
+        )
+        cm <- nn$confusion
+        results <- rbind(
+          results,
+          data.frame(
+            Size = s,
+            Decay = d,
+            Threshold = t,
+            Accuracy = as.numeric(cm$overall["Accuracy"]),
+            Precision = as.numeric(cm$byClass["Pos Pred Value"]),
+            Recall = as.numeric(cm$byClass["Sensitivity"]),
+            F1 = as.numeric(cm$byClass["F1"]),
+            AUC = nn$AUC
+          )
+        )
+      }
+    }
+  }
+  results
+}
+
+###############################
+
+nn_tuning_results <- tune_neural_network(
+  train_data,
+  test_data,
+  selected_vars
+)
+
+nn_tuning_results$F1 <- with(
+  nn_tuning_results,
+  2 * Precision * Recall / (Precision + Recall)
+)
+
+best_params <- nn_tuning_results[which.max(nn_tuning_results$F1), ]
+
+best_params
+```
+
+### Step #3.4: Run Final Neural Network Model
+
+```{r}
+final_nn <- run_neural_network_model(
+  train_data,
+  test_data,
+  selected_vars,
+  size = best_params$Size,
+  decay = best_params$Decay,
+  threshold = best_params$Threshold
+)
+```
+
+### Step #3.5: Evaluate LR-to-NN Model
+
+```{r}
+final_nn$confusion
+confusionMatrix(
+  final_nn$pred_class,
+  factor(test_data$CHF, levels = c("No","Yes")),
+  positive = "Yes"
+)
+
+cm_table <- as.data.frame(final_nn$confusion$table)
+
+conf_matrix <- ggplot(cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6, color = "white") +
+  labs(
+    title = "Test Confusion Matrix for Neural Network",
+    x = "True CHF Status",
+    y = "Predicted CHF Status"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave(
+  "nn_confusion_matrix.png",
+  plot = conf_matrix,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+final_nn$confusion$byClass
+```
